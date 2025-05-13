@@ -63,28 +63,23 @@ def evaluate_actor(
     if run_name is None:
         run_name = f"{env_id}_eval_{int(time.time())}"
     
-    # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() and cuda else "cpu")
     if verbose:
         print(f"Using device: {device}")
         print(f"Loading weights from: {weights_path}")
-    
-    # Create environment
+
     env = make_env(env_id, seed, capture_video, run_name)()
-    
-    # Initialize actor and load weights
+
     actor = Actor(env).to(device)
     actor.load_state_dict(torch.load(weights_path, map_location=device))
     actor.eval()
-    
-    # Initialize tensorboard writer for logging
+
     writer = SummaryWriter(f"eval_runs/{run_name}")
     
     """
-    Evaluation Loop
-    --------------
-    Runs the loaded policy through multiple episodes and collects performance metrics.
-    No training updates are performed - this is purely for evaluation.
+    this is the evaluation loop, previous comment was AI exlaining it so im just rewriting it in my own understanding 
+    running the loaded policy through  episodes and gather  metrics.
+    this is just for evaluation no training .
     """
     episode_rewards = []
     episode_lengths = []
@@ -97,11 +92,10 @@ def evaluate_actor(
         steps = 0
         
         while not done:
-            # Get action from the trained policy
+            
             with torch.no_grad():
                 action, _, _ = actor.get_action(torch.FloatTensor(obs).unsqueeze(0).to(device))
             
-            # Execute action in the environment
             obs, reward, terminated, truncated, _ = env.step(action[0].cpu().numpy())
             
             total_reward += reward
@@ -118,11 +112,7 @@ def evaluate_actor(
         writer.add_scalar("evaluation/episode_reward", total_reward, episode)
         writer.add_scalar("evaluation/episode_length", steps, episode)
     
-    """
-    Results Compilation
-    -----------------
-    Calculate and report statistics on the policy's performance across episodes.
-    """
+   
     mean_reward = np.mean(episode_rewards)
     std_reward = np.std(episode_rewards)
     min_reward = np.min(episode_rewards)
@@ -131,14 +121,14 @@ def evaluate_actor(
     
     elapsed_time = time.time() - start_time
     
-    # Log summary statistics
+   
     writer.add_scalar("evaluation/mean_reward", mean_reward, 0)
     writer.add_scalar("evaluation/std_reward", std_reward, 0)
     writer.add_scalar("evaluation/min_reward", min_reward, 0)
     writer.add_scalar("evaluation/max_reward", max_reward, 0)
     writer.add_scalar("evaluation/mean_length", mean_length, 0)
     
-    # Print summary
+    
     if verbose:
         print("\n" + "="*50)
         print(f"Evaluation Summary for {env_id}")
@@ -150,7 +140,7 @@ def evaluate_actor(
         print(f"Evaluation time: {elapsed_time:.2f} seconds")
         print("="*50)
     
-    # Close environment and writer
+    
     env.close()
     writer.close()
     
@@ -166,11 +156,11 @@ def evaluate_actor(
     }
 
 
-"""
-Command Line Interface
---------------------
-Allows running the evaluation script from the command line with various configuration options.
-"""
+"""allows me to specify weights or anything for right now, basically 
+This script lets me evaluate a pre-trained reinforcement learning policy in 
+a Gym environment by specifying options like the model file, environment ID, 
+number of episodes, and whether to use CUDA or record video—all through simple 
+command-line arguments."""
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a pre-trained actor policy")
     parser.add_argument("--weights", type=str, required=True, help="Path to the pre-trained weights file")
