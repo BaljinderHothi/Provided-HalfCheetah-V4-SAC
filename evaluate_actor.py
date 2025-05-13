@@ -1,110 +1,194 @@
-import torch
+import argparse
 import gymnasium as gym
 import numpy as np
+import torch
+import time
+from torch.utils.tensorboard import SummaryWriter
+
+#importing the actor
 from actor_impl import Actor
 
-""" 
-This section sets up the basic configuration for evaluating the  AI agent.
-It specifies the environment (HalfCheetah-v4), the file path for the pre-trained
-model weights, how many test episodes to run, and which computing device to use
-(GPU if available, otherwise CPU).
+
 """
-ENV_NAME = "HalfCheetah-v4"
-MODEL_WEIGHTS_PATH = "halfcheetah_v4_actor_weights.pt" 
-NUM_EVALUATION_EPISODES = 10
-SEED = 42
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+this function aims to 
+Create a gym environment with standard wrappers for consistent evaluation:
+- flattens observations for consistent input shape
+- records episode statistics for monitoring
+- clips actions to valid ranges
+- normalizes observations and rewards to ensure consistent scaling
+- clips extreme values to prevent numerical issues
+"""
+def make_env(env_id, seed, capture_video=False, run_name=None):
+    def thunk():
+        if capture_video:
+            env = gym.make(env_id, render_mode="rgb_array")
+            if run_name:
+                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        else:
+            env = gym.make(env_id)
+        env = gym.wrappers.FlattenObservation(env)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.ClipAction(env)
+        env = gym.wrappers.NormalizeObservation(env)
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.NormalizeReward(env, gamma=0.99)
+        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env
+    return thunk
 
-def evaluate_agent(env_name, actor_weights_path, num_episodes, seed, device):
-    """
-    This function evaluates how well the AI agent performs in the specified
-    environment. It runs the agent through multiple episodes and records the total
-    rewards achieved. The function handles loading the agent's neural network
-    weights, simulating the environment, and collecting performance statistics.
-    """
-    print(f"Using device: {device}")
 
-    eval_env = gym.vector.make(env_name, num_envs=1, asynchronous=False)
+"""
+Here i am trying to evaluate the actor
+- loads weights from a checkpoint file
+- runs multiple evaluation episodes and reports statistics
+- optionally records videos of the policy in action
+- returns detailed performance metrics
+"""
+def evaluate_actor(
+    weights_path,
+    env_id="HalfCheetah-v4",
+    seed=42,
+    num_episodes=10,
+    capture_video=False,
+    cuda=True,
+    run_name=None,
+    verbose=True,
+):
     
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+   
+    # preparing the environment, device, and model for evaluation.
     
-    actor = Actor(eval_env).to(device)
+    if run_name is None:
+        run_name = f"{env_id}_eval_{int(time.time())}"
     
-    try:
-        actor.load_state_dict(torch.load(actor_weights_path, map_location=device))
-        print(f"Successfully loaded weights from {actor_weights_path}")
-    except FileNotFoundError:
-        print(f"Error: Weights file not found at {actor_weights_path}")
-        print("Please ensure the MODEL_WEIGHTS_PATH is correct and the file exists.")
-        print("Running with uninitialized weights, which will not give meaningful results.")
-    except Exception as e:
-        print(f"Error loading weights: {e}")
-        print("Running with uninitialized weights.")
-
+    # Set up device
+    device = torch.device("cuda" if torch.cuda.is_available() and cuda else "cpu")
+    if verbose:
+        print(f"Using device: {device}")
+        print(f"Loading weights from: {weights_path}")
+    
+    # Create environment
+    env = make_env(env_id, seed, capture_video, run_name)()
+    
+    # Initialize actor and load weights
+    actor = Actor(env).to(device)
+    actor.load_state_dict(torch.load(weights_path, map_location=device))
     actor.eval()
-
-    total_rewards = []
-    print(f"\nEvaluating for {num_episodes} episodes...")
-
+    
+    # Initialize tensorboard writer for logging
+    writer = SummaryWriter(f"eval_runs/{run_name}")
+    
     """
-    This loop runs multiple test episodes, where for each episode:
-    1. The environment is reset to a starting state
-    2. The agent observes the environment and chooses actions
-    3. Actions are applied and rewards are collected
-    4. The process repeats until the episode ends
-    5. The total reward for the episode is recorded
+    Evaluation Loop
+    --------------
+    Runs the loaded policy through multiple episodes and collects performance metrics.
+    No training updates are performed - this is purely for evaluation.
     """
-    for episode in range(num_episodes):
-        obs, info = eval_env.reset(seed=seed + episode) 
+    episode_rewards = []
+    episode_lengths = []
+    start_time = time.time()
+    
+    for episode in range(1, num_episodes + 1):
+        obs, _ = env.reset(seed=seed + episode)
+        done = False
+        total_reward = 0
+        steps = 0
         
-        done_flag_for_vector_env = np.array([False]) 
-        episode_reward = 0.0
-        
-        while not done_flag_for_vector_env[0]:
-            obs_tensor = torch.tensor(obs, dtype=torch.float32).to(device)
-            
+        while not done:
+            # Get action from the trained policy
             with torch.no_grad():
-                _, _, deterministic_action = actor.get_action(obs_tensor)
+                action, _, _ = actor.get_action(torch.FloatTensor(obs).unsqueeze(0).to(device))
             
-            action_np = deterministic_action.cpu().numpy() 
+            # Execute action in the environment
+            obs, reward, terminated, truncated, _ = env.step(action[0].cpu().numpy())
             
-            next_obs, reward, terminated, truncated, info = eval_env.step(action_np)
-            
-            done_flag_for_vector_env[0] = terminated[0] or truncated[0]
-            
-            episode_reward += reward[0]
-            obs = next_obs
-            
-        total_rewards.append(episode_reward)
-        print(f"Episode {episode + 1}/{num_episodes} | Reward: {episode_reward:.2f}")
-
-    eval_env.close()
+            total_reward += reward
+            steps += 1
+            done = terminated or truncated
+        
+        episode_rewards.append(total_reward)
+        episode_lengths.append(steps)
+        
+        if verbose:
+            print(f"Episode {episode}/{num_episodes}, Reward: {total_reward:.2f}, Length: {steps}")
+        
+        # Log to tensorboard
+        writer.add_scalar("evaluation/episode_reward", total_reward, episode)
+        writer.add_scalar("evaluation/episode_length", steps, episode)
     
     """
-    This section calculates summary statistics about the agent's performance
-    across all test episodes, including average reward, standard deviation,
-    and the minimum and maximum rewards achieved.
+    Results Compilation
+    -----------------
+    Calculate and report statistics on the policy's performance across episodes.
     """
-    avg_reward = np.mean(total_rewards)
-    std_reward = np.std(total_rewards)
-    min_reward = np.min(total_rewards)
-    max_reward = np.max(total_rewards)
-
-    print("\n--- Evaluation Summary ---")
-    print(f"Episodes: {num_episodes}")
-    print(f"Average Reward: {avg_reward:.2f} +/- {std_reward:.2f}")
-    print(f"Min Reward: {min_reward:.2f}")
-    print(f"Max Reward: {max_reward:.2f}")
-
-    """
-    This section reports the evaluation results. The goal is to maximize
-    the average reward - higher values indicate better performance of the model.
-    No specific target is set as we want the model to achieve the best possible performance.
-    """
-    print(f"Average reward: {avg_reward:.2f}")
-    print(f"------------------------") # just so i can read the terminal better
+    mean_reward = np.mean(episode_rewards)
+    std_reward = np.std(episode_rewards)
+    min_reward = np.min(episode_rewards)
+    max_reward = np.max(episode_rewards)
+    mean_length = np.mean(episode_lengths)
     
-    return avg_reward, std_reward
+    elapsed_time = time.time() - start_time
+    
+    # Log summary statistics
+    writer.add_scalar("evaluation/mean_reward", mean_reward, 0)
+    writer.add_scalar("evaluation/std_reward", std_reward, 0)
+    writer.add_scalar("evaluation/min_reward", min_reward, 0)
+    writer.add_scalar("evaluation/max_reward", max_reward, 0)
+    writer.add_scalar("evaluation/mean_length", mean_length, 0)
+    
+    # Print summary
+    if verbose:
+        print("\n" + "="*50)
+        print(f"Evaluation Summary for {env_id}")
+        print("="*50)
+        print(f"Total episodes: {num_episodes}")
+        print(f"Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
+        print(f"Min/Max reward: {min_reward:.2f}/{max_reward:.2f}")
+        print(f"Mean episode length: {mean_length:.2f}")
+        print(f"Evaluation time: {elapsed_time:.2f} seconds")
+        print("="*50)
+    
+    # Close environment and writer
+    env.close()
+    writer.close()
+    
+    # Return evaluation metrics
+    return {
+        "mean_reward": mean_reward,
+        "std_reward": std_reward,
+        "min_reward": min_reward,
+        "max_reward": max_reward,
+        "mean_length": mean_length,
+        "episode_rewards": episode_rewards,
+        "episode_lengths": episode_lengths,
+    }
+
+
+"""
+Command Line Interface
+--------------------
+Allows running the evaluation script from the command line with various configuration options.
+"""
 if __name__ == "__main__":
-    evaluate_agent(ENV_NAME, MODEL_WEIGHTS_PATH, NUM_EVALUATION_EPISODES, SEED, DEVICE)
+    parser = argparse.ArgumentParser(description="Evaluate a pre-trained actor policy")
+    parser.add_argument("--weights", type=str, required=True, help="Path to the pre-trained weights file")
+    parser.add_argument("--env-id", type=str, default="HalfCheetah-v4", help="Gym environment ID")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--episodes", type=int, default=10, help="Number of evaluation episodes")
+    parser.add_argument("--no-cuda", action="store_true", help="Disable CUDA")
+    parser.add_argument("--capture-video", action="store_true", help="Capture video of the episodes")
+    parser.add_argument("--run-name", type=str, default=None, help="Name for this evaluation run")
+    
+    args = parser.parse_args()
+    
+    evaluate_actor(
+        weights_path=args.weights,
+        env_id=args.env_id,
+        seed=args.seed,
+        num_episodes=args.episodes,
+        capture_video=args.capture_video,
+        cuda=not args.no_cuda,
+        run_name=args.run_name,
+    )
